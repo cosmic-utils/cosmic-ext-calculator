@@ -15,7 +15,7 @@ use cosmic::{
     cosmic_theme,
     cosmic_theme::ThemeMode,
     iced::{
-        Alignment, Event, Length, Subscription, event,
+        Alignment, Event, Length, Subscription, clipboard, event,
         keyboard::Event as KeyEvent,
         keyboard::key::Named,
         keyboard::{Key, Modifiers},
@@ -31,6 +31,8 @@ use cosmic::{
 };
 
 mod config;
+mod graph;
+mod latex;
 mod operations;
 mod operator;
 pub mod settings;
@@ -51,6 +53,12 @@ pub struct CosmicCalculator {
     input_font_size: f32,
     previous: String,
     mode: Mode,
+    graph: graph::Graph,
+    graph_x: String,
+    graph_y: String,
+    graph_eval_id: u64,
+    // Incremented per request so results from a superseded evaluation are dropped.
+    eval_id: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +66,9 @@ pub enum Message {
     Number(f32),
     Operator(Operator),
     Input(String),
+    Paste(String),
+    PasteShortcut,
+    Clipboard(Option<String>),
     ToggleContextPage(ContextPage),
     ToggleContextDrawer,
     Key(Modifiers, Key, Option<String>),
@@ -70,6 +81,14 @@ pub enum Message {
     Open(String),
     SetDecimalComma(bool),
     Evaluate,
+    Evaluated(u64, Result<operations::Evaluation, String>),
+    Plotted(u64, Result<graph::Plot, String>),
+    /// The graph view after a zoom or a pan: its x range and the y at its middle.
+    View(std::ops::RangeInclusive<f64>, f64),
+    Resample,
+    GraphX(String),
+    GraphEvaluate,
+    GraphEvaluated(u64, Result<operations::Evaluation, String>),
     Window,
     Resized(cosmic::iced::Size),
     Toggle(Mode),
@@ -97,7 +116,8 @@ pub enum MenuAction {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Mode {
     Basic,
-    Scientific
+    Scientific,
+    Graph,
 }
 
 impl menu::action::MenuAction for MenuAction {
@@ -187,7 +207,17 @@ impl Application for CosmicCalculator {
         let Some(data) = self.nav.active_data::<Calculator>().cloned() else {
             return Task::none();
         };
+        if data.is_function() {
+            self.mode = Mode::Graph;
+            self.previous.clear();
+            self.calculator.expression = data.expression.clone();
+            self.calculator.outcome = String::new();
+            return self.plot(data.expression, false);
+        }
         // Restore the result and the formula line that produced it.
+        if self.mode == Mode::Graph {
+            self.mode = Mode::Basic;
+        }
         self.previous = format!("{} =", data.expression.trim());
         self.calculator.expression = data.outcome.to_string();
         self.calculator.outcome = String::new();
@@ -198,9 +228,7 @@ impl Application for CosmicCalculator {
         let mut nav = nav_bar::Model::default();
 
         for entry in &flags.config.history {
-            nav.insert()
-                .text(history_label(&entry.expression))
-                .data(entry.clone());
+            nav.insert().text(history_label(entry)).data(entry.clone());
         }
 
         let about = About::default()
@@ -237,6 +265,11 @@ impl Application for CosmicCalculator {
             input_font_size: 32.0,
             previous: String::new(),
             mode: Mode::Basic, // Defaults to basic mode
+            graph: graph::Graph::new(),
+            graph_x: String::new(),
+            graph_y: String::new(),
+            graph_eval_id: 0,
+            eval_id: 0,
         };
 
         let mut tasks = vec![];
@@ -252,41 +285,40 @@ impl Application for CosmicCalculator {
     }
 
     fn header_start<'a>(&'a self) -> Vec<Element<'a, Self::Message>> {
-        // If the current mode is basic, the button switches to scientific mode, and vice-versa
+        let mode_items = [Mode::Basic, Mode::Scientific, Mode::Graph]
+            .into_iter()
+            .filter(|mode| *mode != self.mode)
+            .map(|mode| {
+                let label = match mode {
+                    Mode::Basic => fl!("basic-mode"),
+                    Mode::Scientific => fl!("scientific-mode"),
+                    Mode::Graph => fl!("graph-mode"),
+                };
+                menu::Item::Button(
+                    label,
+                    Some(icons::get_handle("settings-symbolic", 14)),
+                    MenuAction::Toggle(mode),
+                )
+            });
 
-        let scientific_label = match self.mode {
-            Mode::Basic => fl!("scientific-mode"),
-            Mode::Scientific => fl!("basic-mode"),
-        };
-
-        let toggle = match self.mode {
-            Mode::Basic => MenuAction::Toggle(Mode::Scientific),
-            Mode::Scientific => MenuAction::Toggle(Mode::Basic),
-        };
+        let mut items = mode_items.collect::<Vec<_>>();
+        items.extend([
+            menu::Item::Button(
+                fl!("clear-history"),
+                Some(icons::get_handle("large-brush-symbolic", 14)),
+                MenuAction::ClearHistory,
+            ),
+            menu::Item::Divider,
+            menu::Item::Button(
+                fl!("about"),
+                Some(icons::get_handle("settings-symbolic", 14)),
+                MenuAction::About,
+            ),
+        ]);
 
         let menu_bar = menu::bar(vec![menu::Tree::with_children(
             RcElementWrapper::new(menu::root(fl!("view")).into()),
-            menu::items(
-                &self.key_binds,
-                vec![
-                    menu::Item::Button(
-                        scientific_label,
-                        Some(icons::get_handle("settings-symbolic", 14)),
-                        toggle,
-                    ),
-                    menu::Item::Button(
-                        fl!("clear-history"),
-                        Some(icons::get_handle("large-brush-symbolic", 14)),
-                        MenuAction::ClearHistory,
-                    ),
-                    menu::Item::Divider,
-                    menu::Item::Button(
-                        fl!("about"),
-                        Some(icons::get_handle("settings-symbolic", 14)),
-                        MenuAction::About,
-                    ),
-                ],
-            ),
+            menu::items(&self.key_binds, items),
         )])
         .item_height(ItemHeight::Dynamic(40))
         .item_width(ItemWidth::Uniform(240))
@@ -318,7 +350,7 @@ impl Application for CosmicCalculator {
         // Build the keypad column with more rows in scientific mode
         let mut keypad = widget::column::with_capacity(
             match self.mode {
-                Mode::Basic => 7,
+                Mode::Basic | Mode::Graph => 7,
                 Mode::Scientific => 11,
             }
         );
@@ -454,15 +486,40 @@ impl Application for CosmicCalculator {
                     .push(
                         widget::text_input("", &self.calculator.expression)
                             .on_input(Message::Input)
+                            .on_paste(Message::Paste)
                             .on_submit(|_| Message::Operator(Operator::Equal))
                             .id(self.input_id.clone())
                             .size(self.input_font_size)
                             .padding(spacing.space_xxs)
                             .width(Length::Fill),
                     )
+                    .push_maybe((self.mode == Mode::Graph).then(|| {
+                        widget::row::with_capacity(3)
+                            .push(widget::text("x ="))
+                            .push(
+                                widget::text_input("", &self.graph_x)
+                                    .on_input(Message::GraphX)
+                                    .on_submit(|_| Message::GraphEvaluate)
+                                    .width(Length::Fixed(160.0)),
+                            )
+                            .push(widget::text(format!("y = {}", self.graph_y)))
+                            .spacing(spacing.space_xs)
+                            .align_y(Alignment::Center)
+                    }))
                     .spacing(2),
             )
-            .push(keypad)
+            .push(match self.mode {
+                Mode::Graph => widget::column::with_capacity(2)
+                    .push(
+                        widget::canvas(&self.graph)
+                            .width(Length::Fill)
+                            .height(Length::Fill),
+                    )
+                    // The keypad carries the toaster in the other modes.
+                    .push(widget::toaster(&self.toasts, widget::space::horizontal()))
+                    .into(),
+                _ => Element::from(keypad),
+            })
             .align_x(Alignment::Center)
             .spacing(spacing.space_s)
             .padding([0, spacing.space_xxs, spacing.space_xxs, spacing.space_xxs])
@@ -502,9 +559,33 @@ impl Application for CosmicCalculator {
             }
             Message::Number(num) => self.calculator.on_number_press(num),
             Message::Input(input) => self.calculator.on_input(input),
+            Message::Paste(content) => {
+                if let Err(error) = self.calculator.on_paste(&content) {
+                    tasks.push(self.update(Message::ShowToast(paste_error(&error))));
+                }
+            }
+            Message::PasteShortcut => {
+                tasks.push(
+                    clipboard::read().map(|text| cosmic::Action::App(Message::Clipboard(text))),
+                );
+            }
+            Message::Clipboard(text) => {
+                let Some(text) = text else {
+                    return Task::batch(tasks);
+                };
+                let content = format!("{}{}", self.calculator.expression, text);
+                tasks.push(self.update(Message::Paste(content)));
+                tasks.push(widget::text_input::focus(self.input_id.clone()));
+                tasks.push(widget::text_input::move_cursor_to_end(
+                    self.input_id.clone(),
+                ));
+            }
             Message::Operator(operator) => {
                 if operator == Operator::Clear {
                     self.previous.clear();
+                    self.graph.reset();
+                    // A plot still being sampled belongs to what was just cleared.
+                    self.eval_id += 1;
                 }
                 if let Some(operations::Message::Evaluate) =
                     self.calculator.on_operator_press(&operator)
@@ -517,69 +598,123 @@ impl Application for CosmicCalculator {
                 if self.calculator.expression.trim().is_empty() {
                     return Task::batch(tasks);
                 }
-
-                let eval_expression = self.calculator.eval_expression();
-                let mut command = self.calculator.qalc_command(false);
-                command.arg(&eval_expression);
-
-                let Ok(output) = command.output() else {
-                    tracing::error!("Failed to execute qalc command");
-                    tasks.push(self.update(Message::ShowToast(
-                        "Failed to execute qalc command".to_string(),
-                    )));
+                if self.mode == Mode::Graph {
+                    let expression = self.calculator.expression.clone();
+                    tasks.push(self.plot(expression, true));
+                } else {
+                    self.eval_id += 1;
+                    let id = self.eval_id;
+                    let calculator = self.calculator.clone();
+                    tasks.push(Task::perform(
+                        operations::blocking(move || calculator.evaluate()),
+                        move |evaluation| cosmic::Action::App(Message::Evaluated(id, evaluation)),
+                    ));
+                }
+            }
+            Message::Evaluated(id, evaluation) => {
+                if id != self.eval_id {
                     return Task::batch(tasks);
+                }
+                let evaluation = match evaluation {
+                    Ok(evaluation) => evaluation,
+                    Err(error) => {
+                        tracing::error!("{}", error);
+                        tasks.push(self.update(Message::ShowToast(error)));
+                        return Task::batch(tasks);
+                    }
                 };
 
-                let outcome = operations::parse_output(output.stdout);
-
-                // qalc writes warnings to stderr even on success, so only treat the
-                // run as failed when stdout has no usable result.
-                if outcome.is_empty() {
-                    let error = String::from_utf8(output.stderr).unwrap_or_default();
-                    if error.is_empty() {
-                        tracing::error!("Failed to parse qalc output");
-                        tasks.push(self.update(Message::ShowToast(
-                            "Failed to parse qalc output".to_string(),
-                        )));
-                    } else {
-                        tracing::error!("An error occurred: {}", error);
-                        tasks
-                            .push(self.update(Message::ShowToast("An error occurred".to_string())));
-                    }
-                    return Task::batch(tasks);
-                }
-
                 self.previous = format!("{} =", self.calculator.expression.trim());
-                self.calculator.outcome = outcome.clone();
-
-                // Second pass: keep an exact (or high-precision) value for chaining.
-                let exact = self
-                    .calculator
-                    .qalc_command(true)
-                    .arg(&eval_expression)
-                    .output()
-                    .ok()
-                    .map(|output| operations::parse_output(output.stdout))
-                    .filter(|exact| !exact.is_empty() && exact.chars().count() <= 1000);
-                self.calculator.outcome_exact = exact.unwrap_or_else(|| outcome.clone());
+                self.calculator.outcome = evaluation.outcome.clone();
+                self.calculator.outcome_exact = evaluation.exact;
                 self.calculator.chain_exact = true;
 
-                let mut history = self.config.history.clone();
-                history.push(self.calculator.clone());
-                if let Some(config_handler) = &self.config_handler
-                    && let Err(err) = self.config.set_history(config_handler, history)
-                {
-                    tracing::error!("Failed to save history: {}", err);
-                    tasks.push(
-                        self.update(Message::ShowToast("Failed to save history".to_string())),
-                    );
-                }
-                self.nav
-                    .insert()
-                    .text(history_label(&self.calculator.expression))
-                    .data(self.calculator.clone());
+                let entry = self.calculator.clone();
+                tasks.push(self.add_to_history(entry));
 
-                self.calculator.expression = outcome;
+                self.calculator.expression = evaluation.outcome;
+            }
+            Message::Plotted(id, plot) => {
+                if self.graph.pending == Some(id) {
+                    self.graph.pending = None;
+                }
+                if id != self.eval_id {
+                    return Task::batch(tasks);
+                }
+                match plot {
+                    Ok(plot) => {
+                        if plot.requested {
+                            let entry = Calculator::function(
+                                plot.expression.clone(),
+                                self.calculator.decimal_comma,
+                            );
+                            if self.config.history.last() != Some(&entry) {
+                                tasks.push(self.add_to_history(entry));
+                            }
+                        }
+                        if plot.expression != self.graph.expression {
+                            self.graph.reset_view();
+                        }
+                        self.graph.expression = plot.expression;
+                        self.graph.sampled = plot.range;
+                        self.graph.values = plot.values;
+                        if !self.graph_x.trim().is_empty() {
+                            tasks.push(self.update(Message::GraphEvaluate));
+                        }
+                        // The view may have moved on while this was sampled.
+                        tasks.push(self.update(Message::Resample));
+                    }
+                    Err(error) => {
+                        tracing::error!("{}", error);
+                        tasks.push(self.update(Message::ShowToast(error)));
+                    }
+                }
+            }
+            Message::View(range, center) => {
+                self.graph.range = range;
+                self.graph.y_center = Some(center);
+                tasks.push(self.update(Message::Resample));
+            }
+            Message::GraphX(x) => self.graph_x = x,
+            Message::GraphEvaluate => {
+                let (expression, x) = (self.calculator.expression.trim(), self.graph_x.trim());
+                if expression.is_empty() || x.is_empty() {
+                    self.graph_y.clear();
+                    return Task::batch(tasks);
+                }
+                self.graph_eval_id += 1;
+                let id = self.graph_eval_id;
+                let calculator = Calculator {
+                    expression: format!("({expression}) where x=({x})"),
+                    decimal_comma: self.calculator.decimal_comma,
+                    ..Calculator::new()
+                };
+                tasks.push(Task::perform(
+                    operations::blocking(move || calculator.evaluate()),
+                    move |evaluation| cosmic::Action::App(Message::GraphEvaluated(id, evaluation)),
+                ));
+            }
+            Message::GraphEvaluated(id, evaluation) => {
+                if id != self.graph_eval_id {
+                    return Task::batch(tasks);
+                }
+                match evaluation {
+                    Ok(evaluation) => self.graph_y = evaluation.outcome,
+                    Err(error) => {
+                        tracing::error!("{}", error);
+                        tasks.push(self.update(Message::ShowToast(error)));
+                    }
+                }
+            }
+            Message::Resample => {
+                // One request at a time: its result asks again if the view moved on meanwhile.
+                if !self.graph.values.is_empty()
+                    && self.graph.pending.is_none()
+                    && self.graph.is_stale()
+                {
+                    let expression = self.graph.expression.clone();
+                    tasks.push(self.plot(expression, false));
+                }
             }
             Message::Key(modifiers, key, text) => {
                 for (key_bind, action) in &self.key_binds {
@@ -684,6 +819,7 @@ impl Application for CosmicCalculator {
             Message::Resized(size) => {
                 self.button_font_size = (size.height / 22.0).clamp(10.0, 48.0);
                 self.input_font_size = (size.height * 0.065).clamp(14.0, 32.0);
+                self.graph.resize(size.width);
             }
             Message::Toggle(mode) => self.mode = mode,
         }
@@ -710,6 +846,18 @@ impl Application for CosmicCalculator {
 
         let subscriptions = vec![
             event::listen_with(|event, status, _id| match event {
+                // The field handles Ctrl+V itself when focused; this is for when it is not.
+                Event::Keyboard(KeyEvent::KeyPressed {
+                    key,
+                    modifiers,
+                    physical_key,
+                    ..
+                }) if status == event::Status::Ignored
+                    && modifiers.control()
+                    && key.to_latin(physical_key) == Some('v') =>
+                {
+                    Some(Message::PasteShortcut)
+                }
                 Event::Keyboard(KeyEvent::KeyPressed { key, modifiers, text, .. }) => match status {
                     event::Status::Ignored => {
                         Some(Message::Key(modifiers, key, text.map(|t| t.to_string())))
@@ -763,14 +911,70 @@ impl CosmicCalculator {
     fn update_config(&mut self) -> Task<Message> {
         cosmic::command::set_theme(self.config.app_theme.theme())
     }
+
+    fn plot(&mut self, expression: String, requested: bool) -> Task<Message> {
+        self.eval_id += 1;
+        let id = self.eval_id;
+        self.graph.pending = Some(id);
+        let view = if expression == self.graph.expression {
+            self.graph.range.clone()
+        } else {
+            graph::Graph::DEFAULT_RANGE
+        };
+        let calculator = self.calculator.clone();
+        let (range, samples) = (
+            graph::Graph::sampling_range(&view),
+            self.graph.sampling_count(),
+        );
+        Task::perform(
+            operations::blocking(move || {
+                let values = calculator.sample(&expression, &range, samples)?;
+                Ok(graph::Plot {
+                    expression,
+                    range,
+                    values,
+                    requested,
+                })
+            }),
+            move |plot| cosmic::Action::App(Message::Plotted(id, plot)),
+        )
+    }
+
+    fn add_to_history(&mut self, entry: Calculator) -> Task<Message> {
+        let mut history = self.config.history.clone();
+        history.push(entry.clone());
+        let mut task = Task::none();
+        if let Some(config_handler) = &self.config_handler
+            && let Err(err) = self.config.set_history(config_handler, history)
+        {
+            tracing::error!("Failed to save history: {}", err);
+            task = self.update(Message::ShowToast("Failed to save history".to_string()));
+        }
+        self.nav.insert().text(history_label(&entry)).data(entry);
+        task
+    }
 }
 
-// Sidebar label: expression truncated to fit the sidebar width.
-fn history_label(expression: &str) -> String {
+fn paste_error(error: &operations::PasteError) -> String {
+    match error {
+        operations::PasteError::Equation => fl!("paste-equation"),
+        operations::PasteError::Unsupported(c) => {
+            fl!("paste-unsupported", character = c.to_string())
+        }
+        operations::PasteError::Latex(token) => fl!("paste-latex", token = token.clone()),
+    }
+}
+
+fn history_label(entry: &Calculator) -> String {
     const MAX: usize = 28;
-    if expression.chars().count() > MAX {
-        expression.chars().take(MAX).collect::<String>() + "…"
+    let label = if entry.is_function() {
+        format!("y = {}", entry.expression)
     } else {
-        expression.to_string()
+        entry.expression.clone()
+    };
+    if label.chars().count() > MAX {
+        label.chars().take(MAX).collect::<String>() + "…"
+    } else {
+        label
     }
 }

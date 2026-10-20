@@ -27,6 +27,8 @@ features = [
     "tokio",
     # Windowing support for X11, Windows, Mac, & Redox
     "winit",
+    # Add Wayland support to winit
+    "wayland",
     # GPU-accelerated rendering
     "wgpu",
 ]
