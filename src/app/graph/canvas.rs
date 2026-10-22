@@ -1,4 +1,6 @@
-use crate::app::Message;
+use super::Message;
+use super::numeric::Points;
+use crate::app;
 use cosmic::Theme;
 use cosmic::iced::widget::canvas::{self, Action, Event, Frame, Geometry, Path, Stroke, Text};
 use cosmic::iced::{Color, Pixels, Point, Rectangle, Renderer, Size, alignment, mouse};
@@ -9,24 +11,28 @@ pub struct Graph {
     pub range: RangeInclusive<f64>,
     /// y at the middle of the view; `None` puts it where the curve is.
     pub y_center: Option<f64>,
-    /// x range the current samples were taken over: wider than the view, so a pan has curve to show.
+    /// x range of the latest sampling: wider than the view, so a pan has curve to show.
     pub sampled: RangeInclusive<f64>,
-    /// The function the samples belong to, which is not always what the field says.
+    pub sampling: String,
+    /// The function the points belong to, which is not always what the field says.
     pub expression: String,
-    pub values: Vec<Option<f64>>,
-    /// Samples per view width: one per pixel, so zooming never under-samples the view.
+    pub points: Points,
+    /// Pixels of a view width: a sample every one or two of them.
     pub samples: usize,
     /// Id of the plot being sampled, so only one request runs at a time.
     pub pending: Option<u64>,
+    pub progressive: bool,
+    /// Whether the latest sampling got to its end: cut short, it is taken up again.
+    pub complete: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct Plot {
     pub expression: String,
-    pub range: RangeInclusive<f64>,
-    pub values: Vec<Option<f64>>,
+    pub points: Points,
     /// Asked for by the user, as opposed to taken again after a zoom or a pan.
     pub requested: bool,
+    pub done: bool,
 }
 
 /// Drag in progress: its start and the view then, so a pan is computed from the anchor.
@@ -43,10 +49,13 @@ impl Graph {
             range: Self::DEFAULT_RANGE,
             y_center: None,
             sampled: Self::DEFAULT_RANGE,
+            sampling: String::new(),
             expression: String::new(),
-            values: Vec::new(),
+            points: Vec::new(),
             samples: 800,
             pending: None,
+            progressive: false,
+            complete: false,
         }
     }
 
@@ -65,14 +74,23 @@ impl Graph {
         self.y_center = None;
     }
 
-    /// The x range to sample for a view: a view width more on each side, so a pan has curve to show.
-    pub fn sampling_range(view: &RangeInclusive<f64>) -> RangeInclusive<f64> {
+    /// A view width more on each side, at a power-of-two spacing: pans and zooms reuse the points.
+    pub fn sampling(&self, view: &RangeInclusive<f64>) -> (RangeInclusive<f64>, usize) {
         let (start, end) = (*view.start(), *view.end());
-        (start - (end - start))..=(end + (end - start))
-    }
-
-    pub fn sampling_count(&self) -> usize {
-        3 * (self.samples - 1) + 1
+        let width = end - start;
+        let (from, to) = (start - width, end + width);
+        // No finer than the f64s that far out can tell apart.
+        let finest = from.abs().max(to.abs()) * f64::EPSILON;
+        let pixel = (width / (self.samples - 1) as f64).max(finest);
+        let spacing = 2f64.powi(pixel.log2().ceil() as i32);
+        let (first, last) = ((from / spacing).floor(), (to / spacing).ceil());
+        if !(spacing > 0.0 && first.is_finite() && last.is_finite() && last > first) {
+            return (from..=to, 3 * (self.samples - 1) + 1);
+        }
+        (
+            (first * spacing)..=(last * spacing),
+            (last - first) as usize + 1,
+        )
     }
 
     pub fn is_stale(&self) -> bool {
@@ -87,17 +105,21 @@ impl Graph {
         first < start + taken / 2.0 || last > end - taken / 2.0 || !(0.67..=1.5).contains(&scale)
     }
 
+    pub fn needs_sampling(&self) -> bool {
+        // A native plot can take minutes, so the view it no longer serves supersedes it.
+        let free = self.pending.is_none() || self.progressive;
+        let cut = !self.complete && self.pending.is_none();
+        !self.points.is_empty()
+            && self.sampling == self.expression
+            && free
+            && (self.is_stale() || cut)
+    }
+
     fn visible(&self) -> Vec<f64> {
-        if self.values.len() < 2 {
-            return Vec::new();
-        }
-        let (start, end) = (*self.sampled.start(), *self.sampled.end());
-        let step = (end - start) / (self.values.len() - 1) as f64;
-        self.values
+        self.points
             .iter()
-            .enumerate()
-            .filter(|(i, _)| self.range.contains(&(start + step * *i as f64)))
-            .filter_map(|(_, value)| *value)
+            .filter(|(x, _)| self.range.contains(x))
+            .filter_map(|(_, y)| *y)
             .collect()
     }
 
@@ -139,17 +161,16 @@ impl Graph {
     }
 
     fn sample_at(&self, x: f64) -> Option<(f64, f64)> {
-        if self.values.len() < 2 {
+        let (first, last) = (self.points.first()?.0, self.points.last()?.0);
+        if !(first..=last).contains(&x) {
             return None;
         }
-        let (s0, s1) = (*self.sampled.start(), *self.sampled.end());
-        let step = (s1 - s0) / (self.values.len() - 1) as f64;
-        let index = ((x - s0) / step).round();
-        if index < 0.0 || index >= self.values.len() as f64 {
-            return None;
-        }
-        let y = (*self.values.get(index as usize)?)?;
-        Some((s0 + step * index, y))
+        let next = self.points.partition_point(|(at, _)| *at < x);
+        let (at, y) = [next.saturating_sub(1), next]
+            .into_iter()
+            .filter_map(|i| self.points.get(i))
+            .min_by(|a, b| (a.0 - x).abs().total_cmp(&(b.0 - x).abs()))?;
+        Some((*at, (*y)?))
     }
 
     fn render(&self, frame: &mut Frame, theme: &Theme, cursor: Option<Point>) {
@@ -218,12 +239,7 @@ impl Graph {
             frame.stroke(&Path::line(to_screen(0.0, y0), to_screen(0.0, y1)), axis);
         }
 
-        // The curve, broken wherever a sample is undefined and across poles.
-        if self.values.len() < 2 {
-            return;
-        }
-        let (s0, s1) = (*self.sampled.start(), *self.sampled.end());
-        let step = (s1 - s0) / (self.values.len() - 1) as f64;
+        // Broken wherever a point is undefined, and across poles.
         let beyond = |y: f64| {
             if y > 0.0 {
                 y1 + (y1 - y0)
@@ -233,12 +249,11 @@ impl Graph {
         };
         let path = Path::new(|builder| {
             let mut previous: Option<(f64, f64)> = None;
-            for (i, value) in self.values.iter().enumerate() {
-                let Some(y) = *value else {
+            for &(x, value) in &self.points {
+                let Some(y) = value else {
                     previous = None;
                     continue;
                 };
-                let x = s0 + step * i as f64;
                 let point = to_screen(x, y);
                 match previous {
                     Some((before_x, before)) if is_pole(before, y, y1 - y0) => {
@@ -296,7 +311,7 @@ impl Graph {
     }
 }
 
-impl canvas::Program<Message, Theme> for Graph {
+impl canvas::Program<app::Message, Theme> for Graph {
     type State = State;
 
     fn update(
@@ -305,7 +320,7 @@ impl canvas::Program<Message, Theme> for Graph {
         event: &Event,
         bounds: Rectangle,
         cursor: mouse::Cursor,
-    ) -> Option<Action<Message>> {
+    ) -> Option<Action<app::Message>> {
         let Event::Mouse(event) = event else {
             return None;
         };
@@ -319,7 +334,7 @@ impl canvas::Program<Message, Theme> for Graph {
                 let factor = f64::from(0.85f32.powf(lines));
                 let at = self.to_graph(bounds, position);
                 let (range, center) = zoomed(&self.range, self.center(bounds.size()), at, factor);
-                Some(Action::publish(Message::View(range, center)).and_capture())
+                Some(Action::publish(Message::View(range, center).into()).and_capture())
             }
             mouse::Event::ButtonPressed(mouse::Button::Left) => {
                 let start = cursor.position_in(bounds)?;
@@ -336,7 +351,7 @@ impl canvas::Program<Message, Theme> for Graph {
                 let to = cursor.position()?;
                 let by = (to.x - bounds.x - start.x, to.y - bounds.y - start.y);
                 let (range, center) = panned(range, *center, by, bounds.width)?;
-                Some(Action::publish(Message::View(range, center)).and_capture())
+                Some(Action::publish(Message::View(range, center).into()).and_capture())
             }
             _ => None,
         }
@@ -485,13 +500,14 @@ mod tests {
 
     fn graph(f: impl Fn(f64) -> f64) -> Graph {
         let mut graph = Graph::new();
-        graph.sampled = Graph::sampling_range(&graph.range);
-        let count = graph.sampling_count();
-        let (start, end) = (*graph.sampled.start(), *graph.sampled.end());
-        graph.values = (0..count)
-            .map(|i| f(start + (end - start) * i as f64 / (count - 1) as f64))
-            .map(|y| y.is_finite().then_some(y))
+        let (range, count) = graph.sampling(&graph.range);
+        graph.points = (0..count)
+            .map(|i| crate::app::graph::numeric::sample_x(&range, count, i))
+            .map(|x| (x, Some(f(x)).filter(|y| y.is_finite())))
             .collect();
+        graph.sampled = range;
+        (graph.sampling, graph.expression) = ("f".to_string(), "f".to_string());
+        graph.complete = true;
         graph
     }
 
@@ -556,19 +572,37 @@ mod tests {
     }
 
     #[test]
-    fn samples_keep_the_density_of_the_view_over_three_views() {
+    fn samples_fall_on_the_same_points_after_a_pan_or_a_zoom_by_two() {
         let graph = Graph::new();
-        let (range, count) = (Graph::sampling_range(&graph.range), graph.sampling_count());
-        assert_eq!((*range.start(), *range.end()), (-30.0, 30.0));
-        let spacing = (range.end() - range.start()) / (count - 1) as f64;
-        assert!((spacing - 20.0 / 799.0).abs() < 1e-12);
+        // Three views of 800 pixels, 1/32 apart: the power of two just above 20/799.
+        assert_eq!(graph.sampling(&graph.range), (-30.0..=30.0, 1921));
+        let (range, count) = graph.sampling(&(-9.3..=10.7));
+        assert_eq!((range, count), (-29.3125..=30.71875, 1922));
+        assert_eq!(graph.sampling(&(-20.0..=20.0)), (-60.0..=60.0, 1921));
+        let (range, count) = graph.sampling(&(1e15..=1e15 + 1.0));
+        assert_eq!((range, count), ((1e15 - 1.0)..=(1e15 + 2.0), 13));
     }
 
     #[test]
     fn only_samples_in_the_view_count() {
         let visible = graph(|x| x).visible();
         assert!(visible.iter().all(|x| (-10.0..=10.0).contains(x)));
-        assert!((798..=800).contains(&visible.len()));
+        assert_eq!(visible.len(), 641);
+    }
+
+    #[test]
+    fn the_readout_takes_the_nearest_point_known() {
+        let mut line = Graph::new();
+        line.points = vec![
+            (0.0, Some(0.0)),
+            (1.0, None),
+            (4.0, Some(4.0)),
+            (4.5, Some(4.5)),
+        ];
+        assert_eq!(line.sample_at(0.4), Some((0.0, 0.0)));
+        assert_eq!(line.sample_at(1.2), None);
+        assert_eq!(line.sample_at(3.0), Some((4.0, 4.0)));
+        assert_eq!(line.sample_at(9.0), None);
     }
 
     #[test]
@@ -589,6 +623,36 @@ mod tests {
         assert!(!line.is_stale());
         line.range = -16.0..=16.0;
         assert!(line.is_stale());
+    }
+
+    #[test]
+    fn a_zoom_out_is_either_sampled_already_or_sampled_again() {
+        for factor in [1.1, 1.3, 1.45, 1.6, 2.0, 4.0] {
+            for anchor in [-10.0, -4.0, 0.0, 7.0, 10.0] {
+                let mut line = graph(|x| x);
+                (line.range, _) = zoomed(&line.range, 0.0, (anchor, 0.0), factor);
+                let (first, last) = (*line.range.start(), *line.range.end());
+                let covered = line.sampled.contains(&first) && line.sampled.contains(&last);
+                assert!(line.needs_sampling() || covered, "×{factor} at {anchor}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_sampling_cut_short_is_taken_up_again() {
+        let mut line = graph(|x| x);
+        assert!(!line.needs_sampling());
+        line.complete = false;
+        assert!(line.needs_sampling());
+        line.pending = Some(1);
+        assert!(!line.needs_sampling());
+        line.range = 25.0..=45.0;
+        line.progressive = true;
+        assert!(line.needs_sampling());
+        line.progressive = false;
+        assert!(!line.needs_sampling());
+        (line.pending, line.sampling) = (None, "g".to_string());
+        assert!(!line.needs_sampling());
     }
 
     #[test]

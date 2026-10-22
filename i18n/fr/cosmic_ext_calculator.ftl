@@ -12,6 +12,8 @@ graph-mode = Mode graphique
 paste-equation = Impossible de coller une équation, collez seulement l’expression
 paste-unsupported = Impossible de coller, caractère non pris en charge : { $character }
 paste-latex = Impossible de coller, LaTeX illisible : { $token }
+numeric-inaccurate = Moins de 6 chiffres justes ici
+numeric-undefined = Aucune valeur en ce point
 
 ## About
 repository = Dépot
