@@ -1,10 +1,25 @@
-use crate::app::operator::Operator;
+use crate::app::{latex, operator::Operator};
+use cosmic::iced::futures::channel::oneshot;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::{
     fmt::Display,
     process::{Command, Stdio},
 };
+
+#[derive(Debug, Clone)]
+pub struct Evaluation {
+    pub outcome: String,
+    pub exact: String,
+}
+
+pub async fn blocking<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let (sender, receiver) = oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(work());
+    });
+    receiver.await.expect("worker thread panicked")
+}
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Calculator {
@@ -79,6 +94,35 @@ impl Calculator {
             command.args(["-set", "autocalc off"]);
         }
         command
+    }
+
+    pub fn evaluate(&self) -> Result<Evaluation, String> {
+        let expression = self.eval_expression();
+        let output = self
+            .qalc_command(false)
+            .arg(&expression)
+            .output()
+            .map_err(|_| "Failed to execute qalc command".to_string())?;
+        let outcome = parse_output(output.stdout);
+        // qalc warns on stderr even on success, so only an empty stdout is a failure.
+        if outcome.is_empty() {
+            let error = String::from_utf8(output.stderr).unwrap_or_default();
+            if error.is_empty() {
+                return Err("Failed to parse qalc output".to_string());
+            }
+            tracing::error!("An error occurred: {}", error);
+            return Err("An error occurred".to_string());
+        }
+        // Second pass: keep an exact (or high-precision) value for chaining.
+        let exact = self
+            .qalc_command(true)
+            .arg(&expression)
+            .output()
+            .ok()
+            .map(|output| parse_output(output.stdout))
+            .filter(|exact| !exact.is_empty() && exact.chars().count() <= 1000)
+            .unwrap_or_else(|| outcome.clone());
+        Ok(Evaluation { outcome, exact })
     }
 
     pub fn on_operator_press(&mut self, operator: &Operator) -> Option<Message> {
@@ -156,31 +200,125 @@ impl Calculator {
         // Exact chaining stays valid only while the result prefix is untouched.
         self.chain_exact =
             self.chain_exact && !self.outcome.is_empty() && input.starts_with(&self.outcome);
-        // qalc validates the expression itself, so keep this filter permissive:
-        // allow letters (sin, pi), whitespace, '!', and ',' for decimal-comma locales.
-        if input.chars().all(|c| {
-            c.is_alphanumeric()
-                || c.is_whitespace()
-                || matches!(
-                    c,
-                    '+' | '-'
-                        | '*'
-                        | '/'
-                        | '÷'
-                        | '×'
-                        | '%'
-                        | '.'
-                        | ','
-                        | ';'
-                        | '('
-                        | ')'
-                        | '^'
-                        | '√'
-                        | '!'
-                        | '\u{8}'
-                )
-        }) {
+        if input.chars().all(is_allowed) {
             self.expression = input;
+        }
+    }
+
+    /// The field pasted: `content` is its whole new text, the clipboard inserted at the cursor.
+    pub fn on_paste(&mut self, content: &str) -> Result<(), PasteError> {
+        self.on_input(clean_paste(content, self.decimal_comma)?);
+        Ok(())
+    }
+}
+
+/// Permissive, since qalc validates the expression.
+fn is_allowed(c: char) -> bool {
+    c.is_alphanumeric()
+        || c.is_whitespace()
+        || matches!(
+            c,
+            '+' | '-'
+                | '*'
+                | '/'
+                | '÷'
+                | '×'
+                | '%'
+                | '.'
+                | ','
+                | ';'
+                | '('
+                | ')'
+                | '^'
+                | '√'
+                | '!'
+                | '\u{8}'
+                | '−'
+                | '·'
+                | '⋅'
+                | '|'
+                | '°'
+                | '∞'
+        )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PasteError {
+    Equation,
+    Unsupported(char),
+    Latex(String),
+}
+
+pub fn clean_paste(text: &str, decimal_comma: bool) -> Result<String, PasteError> {
+    // Invisible operators and spaces that formulas copied from web pages carry along.
+    let visible: String = text
+        .chars()
+        .filter(|c| !matches!(c, '\u{200b}'..='\u{200d}' | '\u{2060}'..='\u{2064}' | '\u{feff}'))
+        .collect();
+    let line = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    let line = strip_math_delimiters(&line);
+    let expression = match split_definition(line) {
+        None => line,
+        Some((head, tail)) => {
+            let (head, tail) = (head.trim(), tail.trim());
+            if tail.is_empty() {
+                head
+            } else if is_definition(head) {
+                tail
+            } else {
+                return Err(PasteError::Equation);
+            }
+        }
+    };
+    if expression.contains(['\\', '{', '}']) {
+        return latex::to_expression(expression, decimal_comma).map_err(PasteError::Latex);
+    }
+    match expression.chars().find(|&c| !is_allowed(c)) {
+        Some(c) => Err(PasteError::Unsupported(c)),
+        None => Ok(expression.to_string()),
+    }
+}
+
+fn strip_math_delimiters(line: &str) -> &str {
+    let line = line.trim();
+    for (open, close) in [("$$", "$$"), ("$", "$"), ("\\(", "\\)"), ("\\[", "\\]")] {
+        if let Some(inner) = line
+            .strip_prefix(open)
+            .and_then(|rest| rest.strip_suffix(close))
+        {
+            return inner.trim();
+        }
+    }
+    line
+}
+
+/// Splits at the first `=` outside braces: the one in `\sum_{k=1}` defines nothing.
+fn split_definition(line: &str) -> Option<(&str, &str)> {
+    let mut depth = 0_usize;
+    for (i, c) in line.char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => depth = depth.saturating_sub(1),
+            '=' if depth == 0 => return Some((&line[..i], &line[i + 1..])),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_definition(head: &str) -> bool {
+    let head = head.replace("\\left", "").replace("\\right", "");
+    let name = |s: &str| {
+        s.chars().next().is_some_and(char::is_alphabetic)
+            && s.chars().all(|c| c.is_alphanumeric() || c == '_')
+    };
+    match head.split_once('(') {
+        None => name(head.trim()),
+        Some((function, arguments)) => {
+            name(function.trim_end())
+                && arguments
+                    .strip_suffix(')')
+                    .is_some_and(|arguments| arguments.split([',', ';']).all(|a| name(a.trim())))
         }
     }
 }
@@ -229,4 +367,124 @@ pub fn autocalc() -> bool {
     qalc_version()
         .and_then(|version| Version::parse(&version).ok())
         .is_some_and(|current| current >= min_version)
+}
+#[cfg(test)]
+mod tests {
+    use super::{Calculator, PasteError, clean_paste};
+
+    #[test]
+    fn paste_is_cleaned_for_evaluation() {
+        let clean = |text: &str| clean_paste(text, false);
+        assert_eq!(clean("y = x^2"), Ok("x^2".to_string()));
+        assert_eq!(clean("f(x) = sin(x)·x"), Ok("sin(x)·x".to_string()));
+        assert_eq!(clean("g(x, y)=x+y"), Ok("x+y".to_string()));
+        assert_eq!(clean("2+3="), Ok("2+3".to_string()));
+        assert_eq!(clean("x^2 = 4"), Err(PasteError::Equation));
+        assert_eq!(clean("sin(x)^2 = 1"), Err(PasteError::Equation));
+        assert_eq!(
+            clean(" sin(x)\n *\u{a0}x\u{2061} \n"),
+            Ok("sin(x) * x".to_string())
+        );
+        assert_eq!(clean("√(1−x²)·|x|"), Ok("√(1−x²)·|x|".to_string()));
+        assert_eq!(clean("1/∞"), Ok("1/∞".to_string()));
+        assert_eq!(clean("x ≤ 2"), Err(PasteError::Unsupported('≤')));
+    }
+
+    #[test]
+    fn infinite_bounds_reach_qalc() {
+        let pasted = |latex: &str| clean_paste(latex, false).unwrap();
+        let outcome = |latex: &str| {
+            let calc = Calculator {
+                expression: pasted(latex),
+                ..Calculator::new()
+            };
+            calc.evaluate().unwrap().outcome
+        };
+        assert_eq!(outcome(r"\int_0^\infty e^{-t}\,dt"), "1");
+        assert_eq!(
+            outcome(r"\int_{-\infty}^{\infty} e^{-t^2}\,dt"),
+            "1.772453850905516027"
+        );
+        let laplace = pasted(r"\int_0^\infty e^{-xt}\,dt");
+        let values = Calculator::new()
+            .sample(&laplace, &(1.0..=2.0), 2, || false)
+            .unwrap();
+        assert_eq!(values, vec![Some(1.0), Some(0.5)]);
+    }
+
+    #[test]
+    fn latex_is_read_like_the_rest_of_the_paste() {
+        let clean = |text: &str| clean_paste(text, false);
+        assert_eq!(
+            clean(r"f(x)=\frac{x^2-1}{2}\sin(3x)"),
+            Ok("(x^2-1)/2*sin(3*x)".to_string())
+        );
+        assert_eq!(clean(r"$y = \sqrt{x}$"), Ok("sqrt(x)".to_string()));
+        assert_eq!(
+            clean(r"\[ f\left(x\right) = \left|x\right|^3 \]"),
+            Ok("abs(x)^3".to_string())
+        );
+        assert_eq!(
+            clean(r"\sum_{k=1}^{3} kx"),
+            Ok("sum(y*x, 1, 3, y)".to_string())
+        );
+        assert_eq!(
+            clean_paste(r"\max(1.5x, 2)", true),
+            Ok("max(1,5*x; 2)".to_string())
+        );
+        assert_eq!(clean(r"\sin(x) = 0.5"), Err(PasteError::Equation));
+        assert_eq!(
+            clean(r"\begin{cases} x \end{cases}"),
+            Err(PasteError::Latex("\\begin".to_string()))
+        );
+        assert_eq!(
+            clean(r"x_1+\alpha"),
+            Err(PasteError::Latex("_".to_string()))
+        );
+    }
+
+    #[test]
+    fn pasted_text_reaches_the_field_and_qalc() {
+        let mut calc = Calculator::new();
+        calc.on_input("−5+".into());
+        assert_eq!(calc.expression, "−5+");
+        calc.on_input("−5+@".into());
+        assert_eq!(calc.expression, "−5+");
+
+        calc.on_input("2+".into());
+        assert_eq!(calc.on_paste("2+x**2"), Ok(()));
+        assert_eq!(calc.expression, "2+x**2");
+        assert_eq!(calc.on_paste("2+@x"), Err(PasteError::Unsupported('@')));
+        assert_eq!(calc.expression, "2+x**2");
+        assert_eq!(calc.on_paste(r"2+x**2+\frac{1}{2}"), Ok(()));
+        assert_eq!(calc.expression, "2+x^2+1/2");
+
+        let pasted = clean_paste("y = √(1−x²)·|x|", false).unwrap();
+        let values = calc.sample(&pasted, &(-1.0..=1.0), 5, || false).unwrap();
+        let expected = [
+            0.0,
+            0.433_012_701_892_219_3,
+            0.0,
+            0.433_012_701_892_219_3,
+            0.0,
+        ];
+        assert_eq!(values.len(), expected.len());
+        for (value, expected) in values.iter().zip(expected) {
+            assert!((value.unwrap() - expected).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn evaluate_runs_both_passes() {
+        let mut calc = Calculator::new();
+        calc.expression = "1/3".into();
+        let evaluation = calc.evaluate().unwrap();
+        assert_eq!(evaluation.outcome, "0.333333333333333333");
+        assert_eq!(evaluation.exact, "1/3");
+        calc.outcome = evaluation.outcome.clone();
+        calc.outcome_exact = evaluation.exact;
+        calc.chain_exact = true;
+        calc.expression = format!("{}×3", evaluation.outcome);
+        assert_eq!(calc.evaluate().unwrap().outcome, "1");
+    }
 }
