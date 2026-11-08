@@ -1,28 +1,50 @@
 /// Translates LaTeX math into a qalc expression; the error is the text that could not be read.
 pub fn to_expression(latex: &str, decimal_comma: bool) -> Result<String, String> {
-    let node = read(tokens(latex, false)?, decimal_comma)?;
+    let node = read(
+        tokens(latex, Syntax::Latex, false)?,
+        Syntax::Latex,
+        decimal_comma,
+    )?;
     let mut expression = String::new();
     node.write(&mut expression, 0, decimal_comma);
     Ok(expression)
 }
 
-/// Reads an expression as the field holds it, decimal commas included, into the tree it means.
+/// Reads an expression as the field holds it, decimal commas included, into the tree qalc reads.
 pub(crate) fn parse(text: &str, decimal_comma: bool) -> Result<Node, String> {
-    read(tokens(text, decimal_comma)?, false)
+    read(
+        tokens(text, Syntax::Field, decimal_comma)?,
+        Syntax::Field,
+        false,
+    )
+}
+
+/// What is read: pasted LaTeX, or the field's text, which follows qalc where the two differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Syntax {
+    Latex,
+    Field,
 }
 
 /// The tree of a whole formula; `decimal_comma` is how its numbers will be written back.
-fn read(tokens: Vec<Token>, decimal_comma: bool) -> Result<Node, String> {
+fn read(
+    (tokens, spaced): (Vec<Token>, Vec<bool>),
+    syntax: Syntax,
+    decimal_comma: bool,
+) -> Result<Node, String> {
     if tokens.len() > MAX_TOKENS {
         return Err("…".to_string());
     }
     let mut parser = Parser {
         tokens,
+        spaced,
+        syntax,
         pos: 0,
         decimal_comma,
         scopes: Vec::new(),
         bars: 0,
         integrals: 0,
+        bare: 0,
         depth: 0,
     };
     let node = parser.expr()?;
@@ -71,7 +93,7 @@ fn is_function(name: &str) -> bool {
     FUNCTIONS.contains(&name)
 }
 
-fn qalc_function(name: &str) -> (String, Option<String>) {
+fn qalc_function(name: &str, syntax: Syntax) -> (String, Option<String>) {
     if let Some(inverse) = name.strip_prefix("arc") {
         return (format!("a{inverse}"), None);
     }
@@ -79,7 +101,8 @@ fn qalc_function(name: &str) -> (String, Option<String>) {
         "sin" | "cos" | "tan" | "cot" | "sec" | "csc" | "sinh" | "cosh" | "tanh" | "coth" => {
             (name.to_string(), Some(format!("a{name}")))
         }
-        "log" | "lg" => ("log10".to_string(), None),
+        // The field's `log` is qalc's, natural with one argument, and qalc has no `lg`.
+        "log" | "lg" if syntax == Syntax::Latex => ("log10".to_string(), None),
         "Gamma" => ("gamma".to_string(), None),
         _ => (name.to_string(), None),
     }
@@ -129,11 +152,50 @@ impl Lexer {
             }
             self.pos += 1;
         }
-        if text.contains(|c: char| c.is_ascii_digit()) {
-            Ok(Token::Number(text))
-        } else {
-            Err(text)
+        if !text.contains(|c: char| c.is_ascii_digit()) {
+            return Err(text);
         }
+        if let Some(exponent) = self.exponent() {
+            text.push_str(&exponent);
+            // qalc reads `1e3.5` and `1e3e2` in ways nothing here does.
+            if self.number_follows() {
+                return Err(text);
+            }
+        }
+        Ok(Token::Number(text))
+    }
+
+    /// `e-3` or `E3` after digits, as qalc reads them; `2e` alone is 2·e.
+    fn exponent(&mut self) -> Option<String> {
+        let at = |i: usize| self.chars.get(self.pos + i).copied();
+        let mark = at(0).filter(|&c| c == 'e' || c == 'E')?;
+        let sign = match at(1) {
+            Some('+') => "+",
+            Some('-' | '−') => "-",
+            _ => "",
+        };
+        let first = 1 + sign.len();
+        at(first).filter(char::is_ascii_digit)?;
+        self.pos += first;
+        let digits = self.take_while(|c| c.is_ascii_digit());
+        Some(format!("{mark}{sign}{digits}"))
+    }
+
+    fn number_follows(&self) -> bool {
+        let at = |i: usize| self.chars.get(self.pos + i).copied();
+        let digit = |i: usize| at(i).is_some_and(|c| c.is_ascii_digit());
+        match at(0) {
+            Some('.') => digit(1),
+            Some(',') => self.decimal_comma && digit(1),
+            Some('e' | 'E') => digit(1) || (matches!(at(1), Some('+' | '-' | '−')) && digit(2)),
+            _ => false,
+        }
+    }
+
+    fn base_follows(&self) -> bool {
+        let at = |i: usize| self.chars.get(self.pos + i).copied();
+        matches!(at(0), Some('x' | 'X' | 'b' | 'B' | 'o' | 'O'))
+            && at(1).is_some_and(|c| c.is_ascii_alphanumeric())
     }
 
     fn word(&mut self, tokens: &mut Vec<Token>) {
@@ -220,29 +282,45 @@ fn symbol(c: char, delimiter: Option<bool>) -> Result<Token, String> {
         '÷' => Token::Symbol('/'),
         'π' => Token::Command("pi".to_string()),
         '∞' => Token::Command("infinity".to_string()),
-        '√' => Token::Command("sqrt".to_string()),
+        '√' => Token::Symbol('√'),
         _ => return Err(c.to_string()),
     })
 }
 
-fn tokens(text: &str, decimal_comma: bool) -> Result<Vec<Token>, String> {
+fn tokens(
+    text: &str,
+    syntax: Syntax,
+    decimal_comma: bool,
+) -> Result<(Vec<Token>, Vec<bool>), String> {
     let mut lexer = Lexer {
         chars: text.chars().collect(),
         pos: 0,
         decimal_comma,
     };
-    let mut tokens = Vec::new();
+    let (mut tokens, mut spaced) = (Vec::new(), Vec::new());
     let mut side = None;
+    let mut space = false;
     while let Some(c) = lexer.peek() {
         if c.is_whitespace() || matches!(c, '$' | '~') {
             lexer.pos += 1;
+            space = true;
             continue;
         }
+        let start = tokens.len();
         let delimiter = side.take();
         if c == '.' && delimiter.is_some() {
             lexer.pos += 1;
         } else if c.is_ascii_digit() || c == '.' {
-            tokens.push(lexer.number()?);
+            let number = lexer.number()?;
+            // qalc joins digits a space apart, `1 000` being 1000, and reads `0x10` in hexadecimal.
+            let zero = number == Token::Number("0".to_string());
+            if syntax == Syntax::Field
+                && (matches!(tokens.last(), Some(Token::Number(_)))
+                    || (zero && lexer.base_follows()))
+            {
+                return Err(describe(&number));
+            }
+            tokens.push(number);
         } else if c.is_ascii_alphabetic() {
             lexer.word(&mut tokens);
         } else if c == '\\' {
@@ -256,14 +334,23 @@ fn tokens(text: &str, decimal_comma: bool) -> Result<Vec<Token>, String> {
                     tokens.push(Token::Symbol('^'));
                 }
                 '²' | '³' => {
+                    // One exponent, as qalc reads it: `x²³` is x^23.
+                    let digit = |c: char| if c == '²' { '2' } else { '3' };
+                    let mut digits = digit(c).to_string();
+                    while let Some(next) = lexer.peek().filter(|&c| c == '²' || c == '³') {
+                        digits.push(digit(next));
+                        lexer.pos += 1;
+                    }
                     tokens.push(Token::Symbol('^'));
-                    tokens.push(Token::Number(if c == '²' { "2" } else { "3" }.to_string()));
+                    tokens.push(Token::Number(digits));
                 }
                 _ => tokens.push(symbol(c, delimiter)?),
             }
         }
+        spaced.extend((start..tokens.len()).map(|i| i == start && space));
+        space = false;
     }
-    Ok(tokens)
+    Ok((tokens, spaced))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -384,6 +471,9 @@ impl Node {
 
 struct Parser {
     tokens: Vec<Token>,
+    /// Whether a space comes before each token: in the field, `1/2 x` is not `1/2x`.
+    spaced: Vec<bool>,
+    syntax: Syntax,
     pos: usize,
     decimal_comma: bool,
     scopes: Vec<(char, char)>,
@@ -391,6 +481,7 @@ struct Parser {
     bars: usize,
     /// Integrals being read: their body ends at the differential.
     integrals: usize,
+    bare: usize,
     depth: usize,
 }
 
@@ -463,7 +554,7 @@ impl Parser {
                             | "lceil"
                     )
             }
-            Token::Symbol('(' | '[' | '{') => true,
+            Token::Symbol('(' | '[' | '{' | '√') => true,
             Token::Symbol('|') => self.bars == 0,
             _ => false,
         };
@@ -472,7 +563,7 @@ impl Parser {
 
     fn starts_bare_operand(&self, token: &Token) -> bool {
         let starts = match token {
-            Token::Number(_) | Token::Name(_) => true,
+            Token::Number(_) | Token::Name(_) | Token::Symbol('√') => true,
             Token::Command(name) => matches!(
                 name.as_str(),
                 "frac" | "dfrac" | "tfrac" | "binom" | "sqrt" | "pi" | "tau" | "infinity"
@@ -511,7 +602,7 @@ impl Parser {
     }
 
     fn term(&mut self) -> Result<Node, String> {
-        let mut node = self.power()?;
+        let mut node = self.group()?;
         loop {
             let (op, explicit) = match self.peek() {
                 Some(Token::Symbol('*')) => (Op::Multiply, true),
@@ -526,11 +617,23 @@ impl Parser {
             let right = if explicit {
                 self.pos += 1;
                 let negative = self.signs();
-                self.power()?.negate_if(negative)
+                self.group()?.negate_if(negative)
             } else {
-                self.power()?
+                self.group()?
             };
             node = Node::binary(op, node, right);
+        }
+        Ok(node)
+    }
+
+    /// Operands the field writes side by side, which qalc multiplies first: `1/2x` is `1/(2x)`.
+    fn group(&mut self) -> Result<Node, String> {
+        let mut node = self.power()?;
+        while self.syntax == Syntax::Field
+            && !self.spaced.get(self.pos).copied().unwrap_or(false)
+            && self.peek().is_some_and(|token| self.starts_operand(token))
+        {
+            node = Node::binary(Op::Multiply, node, self.power()?);
         }
         Ok(node)
     }
@@ -542,9 +645,15 @@ impl Parser {
                 node = if self.degrees() {
                     Node::Degrees(Box::new(node))
                 } else {
-                    Node::binary(Op::Power, node, self.argument()?)
+                    Node::binary(Op::Power, node, self.exponent()?)
                 };
-            } else if self.eat(&Token::Symbol('!')) {
+            } else if self.peek() == Some(&Token::Symbol('!')) {
+                // qalc reads `3!!` as a double factorial and drops the `!` of `|x|!`.
+                let after = self.tokens.get(self.pos.wrapping_sub(1));
+                if self.syntax == Syntax::Field && matches!(after, Some(Token::Symbol('!' | '|'))) {
+                    return Err("!".to_string());
+                }
+                self.pos += 1;
                 node = Node::Factorial(Box::new(node));
             } else if self.eat(&Token::Symbol('°')) {
                 node = Node::Degrees(Box::new(node));
@@ -567,6 +676,28 @@ impl Parser {
         found
     }
 
+    /// Read from the right as qalc does: `2^3^2` is `2^(3^2)`; in the field `2^3!` is `2^(3!)`.
+    fn exponent(&mut self) -> Result<Node, String> {
+        self.depth += 1;
+        if self.depth > MAX_DEPTH {
+            return Err("^".to_string());
+        }
+        let negative = self.signs();
+        let node = match self.syntax {
+            Syntax::Field => self.power()?,
+            Syntax::Latex => {
+                let base = self.primary()?;
+                if self.eat(&Token::Symbol('^')) {
+                    Node::binary(Op::Power, base, self.exponent()?)
+                } else {
+                    base
+                }
+            }
+        };
+        self.depth -= 1;
+        Ok(node.negate_if(negative))
+    }
+
     /// What follows `^` or `_`: a group or a single token, a whole number as people mean it.
     fn argument(&mut self) -> Result<Node, String> {
         let negative = self.signs();
@@ -577,7 +708,7 @@ impl Parser {
     fn strict_argument(&mut self) -> Result<Node, String> {
         if let Some(Token::Number(digits)) = self.tokens.get_mut(self.pos)
             && digits.len() > 1
-            && !digits.contains('.')
+            && digits.chars().all(|c| c.is_ascii_digit())
         {
             return Ok(Node::Number(digits.remove(0).to_string()));
         }
@@ -586,6 +717,17 @@ impl Parser {
 
     fn bare_argument(&mut self) -> Result<Node, String> {
         let negative = self.signs();
+        if self.syntax == Syntax::Field {
+            let start = self.pos;
+            self.bare += 1;
+            let node = self.group()?;
+            self.bare -= 1;
+            // qalc gives a `!` there to the whole call: `sin x!` is `(sin x)!`.
+            if self.tokens[start..self.pos].contains(&Token::Symbol('!')) {
+                return Err("!".to_string());
+            }
+            return Ok(node.negate_if(negative));
+        }
         let mut node = self.power()?;
         while self
             .peek()
@@ -644,7 +786,16 @@ impl Parser {
                 Ok(Node::call("abs", vec![node]))
             }
             Token::Function(name) => self.function(&name),
+            // qalc gives a function word without parentheses there nothing to apply to: `√sin x`.
+            Token::Command(name)
+                if self.bare > 0
+                    && (is_function(&name) || name == "sqrt")
+                    && self.peek() != Some(&Token::Symbol('(')) =>
+            {
+                Err(name)
+            }
             Token::Command(name) => self.command(&name),
+            Token::Symbol('√') => self.command("sqrt"),
             other => Err(describe(&other)),
         }
     }
@@ -667,6 +818,8 @@ impl Parser {
                 let chosen = self.strict_argument()?;
                 Ok(Node::call("binomial", vec![total, chosen]))
             }
+            // The field's `√` is qalc's, a function: `√2x` is `√(2x)`.
+            "sqrt" if self.syntax == Syntax::Field => self.function(name),
             "sqrt" => {
                 let index = if self.eat(&Token::Symbol('[')) {
                     let index = self.expr()?;
@@ -700,6 +853,10 @@ impl Parser {
     }
 
     fn function(&mut self, name: &str) -> Result<Node, String> {
+        // qalc reads `sin^2(x)` and `log_2(x)` otherwise than LaTeX does.
+        if self.syntax == Syntax::Field && matches!(self.peek(), Some(Token::Symbol('^' | '_'))) {
+            return Err(name.to_string());
+        }
         let (mut power, mut base) = (None, None);
         loop {
             if self.eat(&Token::Symbol('^')) {
@@ -715,7 +872,7 @@ impl Parser {
         } else {
             vec![self.bare_argument()?]
         };
-        let (mut qalc, inverse) = qalc_function(name);
+        let (mut qalc, inverse) = qalc_function(name, self.syntax);
         if let Some(base) = base {
             if name != "log" {
                 return Err("_".to_string());
@@ -835,7 +992,7 @@ impl Parser {
 
 #[cfg(test)]
 mod tests {
-    use super::to_expression;
+    use super::{parse, to_expression};
 
     fn read(latex: &str) -> String {
         to_expression(latex, false).unwrap()
@@ -843,6 +1000,39 @@ mod tests {
 
     fn refused(latex: &str) -> String {
         to_expression(latex, false).unwrap_err()
+    }
+
+    fn field(text: &str) -> Result<String, String> {
+        let node = parse(text, false)?;
+        let mut expression = String::new();
+        node.write(&mut expression, 0, false);
+        Ok(expression)
+    }
+
+    #[test]
+    fn reads_the_field_as_qalc_does() {
+        let cases = [
+            ("1e-3*x+2E3+2e-x", "1e-3*x+2E3+2*e-x"),
+            ("log(x)+log(x, 2)", "log(x)+log(x, 2)"),
+            ("2^3^2+2^-3^2+x²³", "2^(3^2)+2^(-3^2)+x^23"),
+            ("2^3!", "2^(3!)"),
+            ("1/2x+1/2 x", "1/(2*x)+1/2*x"),
+            ("√2x+√2 x+sin 2x", "sqrt(2*x)+sqrt(2)*x+sin(2*x)"),
+        ];
+        for (text, expected) in cases {
+            assert_eq!(field(text), Ok(expected.to_string()), "{text}");
+        }
+        for text in [
+            "0x10", "1 000", "1e3.5", "sin^2(x)", "log_2(x)", "3!!", "|x|!", "sin x!", "√sin x",
+        ] {
+            assert!(field(text).is_err(), "{text}");
+        }
+    }
+
+    #[test]
+    fn keeps_what_the_field_already_holds() {
+        assert_eq!(read(r"6.02E23\cdot 2^3^2"), "6.02E23*2^(3^2)");
+        assert_eq!(read(r"\log x+x^2!"), "log10(x)+(x^2)!");
     }
 
     #[test]
@@ -959,5 +1149,8 @@ mod tests {
         assert!(to_expression(&format!("x{}", "!".repeat(10_000)), false).is_err());
         assert!(to_expression(&r"\sin ".repeat(10_000), false).is_err());
         assert!(to_expression(&"1+".repeat(10_000), false).is_err());
+        let powers = format!("{}2", "2^".repeat(600));
+        assert!(to_expression(&powers, false).is_err());
+        assert!(parse(&powers, false).is_err());
     }
 }

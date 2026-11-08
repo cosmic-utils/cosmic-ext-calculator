@@ -81,7 +81,7 @@ pub enum Message {
     Open(String),
     SetDecimalComma(bool),
     Evaluate,
-    Evaluated(u64, Result<operations::Evaluation, String>),
+    Evaluated(u64, Calculator, Result<operations::Evaluation, String>),
     Graph(graph::Message),
     Window,
     Resized(cosmic::iced::Size),
@@ -209,6 +209,7 @@ impl Application for CosmicCalculator {
             return self.plot(data.expression, false);
         }
         // Restore the result and the formula line that produced it.
+        self.next_request();
         if self.mode == Mode::Graph {
             self.mode = Mode::Basic;
         }
@@ -556,6 +557,7 @@ impl Application for CosmicCalculator {
                 if operator == Operator::Clear {
                     self.previous.clear();
                     self.graph.reset();
+                    self.readout.reset();
                     // A plot still being sampled belongs to what was just cleared.
                     self.next_request();
                 }
@@ -577,13 +579,21 @@ impl Application for CosmicCalculator {
                     let id = self.next_request();
                     let calculator = self.calculator.clone();
                     tasks.push(Task::perform(
-                        operations::blocking(move || calculator.evaluate()),
-                        move |evaluation| cosmic::Action::App(Message::Evaluated(id, evaluation)),
+                        operations::blocking(move || {
+                            let evaluation = calculator.evaluate();
+                            (calculator, evaluation)
+                        }),
+                        move |(asked, evaluation)| {
+                            cosmic::Action::App(Message::Evaluated(id, asked, evaluation))
+                        },
                     ));
                 }
             }
-            Message::Evaluated(id, evaluation) => {
-                if id != self.eval_id.load(Ordering::Relaxed) {
+            Message::Evaluated(id, asked, evaluation) => {
+                // Only for the latest request, and while the field still holds what it asked.
+                if id != self.eval_id.load(Ordering::Relaxed)
+                    || asked.expression != self.calculator.expression
+                {
                     return Task::batch(tasks);
                 }
                 let evaluation = match evaluation {
@@ -595,10 +605,13 @@ impl Application for CosmicCalculator {
                     }
                 };
 
-                self.previous = format!("{} =", self.calculator.expression.trim());
-                self.calculator.outcome = evaluation.outcome.clone();
-                self.calculator.outcome_exact = evaluation.exact;
-                self.calculator.chain_exact = true;
+                self.previous = format!("{} =", asked.expression.trim());
+                self.calculator = Calculator {
+                    outcome: evaluation.outcome.clone(),
+                    outcome_exact: evaluation.exact,
+                    chain_exact: true,
+                    ..asked
+                };
 
                 let entry = self.calculator.clone();
                 tasks.push(self.add_to_history(entry));
@@ -843,5 +856,84 @@ fn history_label(entry: &Calculator) -> String {
         label.chars().take(MAX).collect::<String>() + "…"
     } else {
         label
+    }
+}
+
+#[cfg(test)]
+impl CosmicCalculator {
+    pub(crate) fn headless() -> Self {
+        CosmicCalculator {
+            core: Core::default(),
+            about: About::default(),
+            context_page: ContextPage::default(),
+            key_binds: key_binds(),
+            nav: nav_bar::Model::default(),
+            modifiers: Modifiers::empty(),
+            config_handler: None,
+            config: config::CalculatorConfig::default(),
+            calculator: Calculator::new(),
+            toasts: widget::toaster::Toasts::new(Message::CloseToast),
+            input_id: widget::Id::unique(),
+            button_font_size: 20.0,
+            input_font_size: 32.0,
+            previous: String::new(),
+            mode: Mode::Basic,
+            graph: graph::Graph::new(),
+            readout: graph::Readout::default(),
+            eval_id: Arc::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Calculator, CosmicCalculator, Message, Ordering, operations::Evaluation};
+    use cosmic::Application;
+
+    fn answer(outcome: &str) -> Result<Evaluation, String> {
+        Ok(Evaluation {
+            outcome: outcome.to_string(),
+            exact: outcome.to_string(),
+        })
+    }
+
+    fn ask(app: &mut CosmicCalculator, expression: &str) -> (u64, Calculator) {
+        app.calculator.expression = expression.to_string();
+        let _ = app.update(Message::Evaluate);
+        (app.eval_id.load(Ordering::Relaxed), app.calculator.clone())
+    }
+
+    #[test]
+    fn a_result_lands_only_on_the_field_that_asked_for_it() {
+        let mut app = CosmicCalculator::headless();
+        let (id, asked) = ask(&mut app, "2+2");
+        let _ = app.update(Message::Input("2+3".to_string()));
+        let _ = app.update(Message::Evaluated(id, asked, answer("4")));
+        assert_eq!(
+            (app.calculator.expression.as_str(), app.nav.len()),
+            ("2+3", 0)
+        );
+        let (id, asked) = ask(&mut app, "25");
+        let entry = Calculator {
+            expression: "5*5".to_string(),
+            outcome: "25".to_string(),
+            ..Calculator::new()
+        };
+        app.nav.insert().text("5*5").data(entry);
+        let _ = app.on_nav_select(app.nav.iter().last().unwrap());
+        let _ = app.update(Message::Evaluated(id, asked, answer("25")));
+        assert_eq!((app.previous.as_str(), app.nav.len()), ("5*5 =", 1));
+        let (id, asked) = ask(&mut app, "2+2");
+        let _ = app.update(Message::Evaluated(id, asked, answer("4")));
+        assert_eq!(
+            (app.previous.as_str(), app.calculator.expression.as_str()),
+            ("2+2 =", "4")
+        );
+        let last = app.nav.iter().last().unwrap();
+        let saved = app.nav.data::<Calculator>(last).unwrap();
+        assert_eq!(
+            (saved.expression.as_str(), saved.outcome.as_str()),
+            ("2+2", "4")
+        );
     }
 }

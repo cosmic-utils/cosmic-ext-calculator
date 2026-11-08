@@ -1201,6 +1201,19 @@ mod tests {
     }
 
     #[test]
+    fn computes_what_qalc_reads() {
+        // A thousandth, the natural log and 2^9, as qalc reads them: not 1·e−3, log10 or 8².
+        let thousandth = at("sum(1e-3*x,1,1,y)", 10.0).unwrap();
+        assert!(close(thousandth, Qd::parse("0.01").unwrap()));
+        assert!(close(at("sum(log(x),1,1,y)", 10.0).unwrap(), Qd::LN_10));
+        let power = at("sum(2^3^2*x,1,1,y)", 10.0).unwrap();
+        assert!(close(power, Qd::from_i64(5120)));
+        let tight = at("sum(1/2x,1,1,y)", 4.0).unwrap();
+        assert!(close(tight, Qd::parse("0.125").unwrap()));
+        assert!(close(at("sum(1/2 x,1,1,y)", 4.0).unwrap(), Qd::from_i64(2)));
+    }
+
+    #[test]
     fn formats_like_the_rest_of_the_calculator() {
         let third = Qd::ONE / Qd::from_i64(3);
         assert_eq!(format(third, 18, false), "0.333333333333333333");

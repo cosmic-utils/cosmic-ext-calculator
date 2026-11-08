@@ -38,6 +38,18 @@ pub struct Readout {
     id: Arc<AtomicU64>,
 }
 
+impl Readout {
+    /// Forgets the y and drops the readout being computed; the x stays for the next function.
+    pub fn reset(&mut self) {
+        self.y.clear();
+        self.next();
+    }
+
+    fn next(&self) -> u64 {
+        self.id.fetch_add(1, Ordering::Relaxed) + 1
+    }
+}
+
 impl Calculator {
     pub fn function(expression: String, decimal_comma: bool) -> Self {
         Self {
@@ -111,8 +123,10 @@ impl CosmicCalculator {
                         }
                         self.graph.expression = plot.expression;
                         self.graph.points = plot.points;
+                        // The readout of the function plotted, whatever the field holds by now.
                         if new && !self.readout.x.trim().is_empty() {
-                            tasks.push(self.update_graph(Message::Evaluate));
+                            let function = self.graph.expression.clone();
+                            tasks.push(self.read_out(&function));
                         }
                         // The view may have moved on while this was sampled.
                         if done {
@@ -135,36 +149,8 @@ impl CosmicCalculator {
             }
             Message::X(x) => self.readout.x = x,
             Message::Evaluate => {
-                let (expression, x) = (self.calculator.expression.trim(), self.readout.x.trim());
-                if expression.is_empty() || x.is_empty() {
-                    self.readout.y.clear();
-                    return Task::batch(tasks);
-                }
-                let id = self.readout.id.fetch_add(1, Ordering::Relaxed) + 1;
-                let decimal_comma = self.calculator.decimal_comma;
-                let evaluated = move |evaluation| {
-                    cosmic::Action::App(Message::Evaluated(id, evaluation).into())
-                };
-                if let Some(formula) = numeric::Formula::shared(expression, decimal_comma) {
-                    let (x, latest) = (x.to_string(), Arc::clone(&self.readout.id));
-                    tasks.push(Task::perform(
-                        operations::blocking(move || {
-                            let superseded = || latest.load(Ordering::Relaxed) != id;
-                            sample::evaluate_native(&formula, &x, decimal_comma, &superseded)
-                        }),
-                        evaluated,
-                    ));
-                    return Task::batch(tasks);
-                }
-                let calculator = Calculator {
-                    expression: format!("({expression}) where x=({x})"),
-                    decimal_comma,
-                    ..Calculator::new()
-                };
-                tasks.push(Task::perform(
-                    operations::blocking(move || calculator.evaluate()),
-                    evaluated,
-                ));
+                let function = self.calculator.expression.clone();
+                tasks.push(self.read_out(&function));
             }
             Message::Evaluated(id, evaluation) => {
                 if id != self.readout.id.load(Ordering::Relaxed) {
@@ -187,6 +173,37 @@ impl CosmicCalculator {
             }
         }
         Task::batch(tasks)
+    }
+
+    fn read_out(&mut self, function: &str) -> Task<app::Message> {
+        let id = self.readout.next();
+        let (expression, x) = (function.trim(), self.readout.x.trim());
+        if expression.is_empty() || x.is_empty() {
+            self.readout.y.clear();
+            return Task::none();
+        }
+        let decimal_comma = self.calculator.decimal_comma;
+        let evaluated =
+            move |evaluation| cosmic::Action::App(Message::Evaluated(id, evaluation).into());
+        if let Some(formula) = numeric::Formula::shared(expression, decimal_comma) {
+            let (x, latest) = (x.to_string(), Arc::clone(&self.readout.id));
+            return Task::perform(
+                operations::blocking(move || {
+                    let superseded = || latest.load(Ordering::Relaxed) != id;
+                    sample::evaluate_native(&formula, &x, decimal_comma, &superseded)
+                }),
+                evaluated,
+            );
+        }
+        let calculator = Calculator {
+            expression: format!("({expression}) where x=({x})"),
+            decimal_comma,
+            ..Calculator::new()
+        };
+        Task::perform(
+            operations::blocking(move || calculator.evaluate()),
+            evaluated,
+        )
     }
 
     pub(super) fn plot(&mut self, expression: String, requested: bool) -> Task<app::Message> {
@@ -253,7 +270,29 @@ impl CosmicCalculator {
 
 #[cfg(test)]
 mod tests {
-    use crate::app::operations::Calculator;
+    use super::Message;
+    use crate::app::operations::{Calculator, Evaluation};
+    use crate::app::{self, CosmicCalculator, Mode, operator::Operator};
+    use cosmic::Application;
+    use std::sync::atomic::Ordering;
+
+    #[test]
+    fn clearing_drops_the_readout_but_keeps_its_x() {
+        let mut app = CosmicCalculator::headless();
+        app.mode = Mode::Graph;
+        app.calculator.expression = "x^2".to_string();
+        app.readout.x = "3".to_string();
+        app.readout.y = "4".to_string();
+        let _ = app.update_graph(Message::Evaluate);
+        let pending = app.readout.id.load(Ordering::Relaxed);
+        let _ = app.update(app::Message::Operator(Operator::Clear));
+        let nine = Evaluation {
+            outcome: "9".to_string(),
+            exact: "9".to_string(),
+        };
+        let _ = app.update_graph(Message::Evaluated(pending, Ok(nine)));
+        assert_eq!((app.readout.x.as_str(), app.readout.y.as_str()), ("3", ""));
+    }
 
     #[test]
     fn history_entries_tell_functions_from_calculations() {

@@ -84,20 +84,34 @@ impl Calculator {
         // Every digit qalc has: 18 fixed decimals would flatten the curve far from the origin.
         command.args(["-set", "maxdeci off"]);
         let text = run(command, format!("genvector({call})"), superseded)?;
-        let inner = text
-            .strip_prefix('[')
-            .and_then(|text| text.strip_suffix(']'))
-            .ok_or_else(|| "Malformed expression".to_string())?;
-        let values: Vec<_> = inner
-            .split("  ")
-            .map(|item| parse_number(item, self.decimal_comma))
-            .collect();
-        // A run that comes back short or long would shift every sample after it.
-        if values.len() != count {
-            return Err("Malformed expression".to_string());
-        }
-        Ok(values)
+        elements(&text, count, self.decimal_comma).ok_or_else(|| "Malformed expression".to_string())
     }
+}
+
+/// Since qalc 5.8.2, over a hundred evenly spaced exact values print as `[start:step:end]`.
+fn elements(text: &str, count: usize, decimal_comma: bool) -> Option<Vec<Option<f64>>> {
+    let inner = text.strip_prefix('[')?.strip_suffix(']')?;
+    let number = |item: &str| parse_number(item, decimal_comma);
+    let values: Vec<_> = match inner.split(':').collect::<Vec<_>>()[..] {
+        [_] => inner.split("  ").map(number).collect(),
+        [start, end] => evenly(number(start)?, 1.0, number(end)?, count)?,
+        [start, step, end] => evenly(number(start)?, number(step)?, number(end)?, count)?,
+        _ => return None,
+    };
+    // A run that comes back short or long would shift every sample after it.
+    (values.len() == count).then_some(values)
+}
+
+fn evenly(start: f64, step: f64, end: f64, count: usize) -> Option<Vec<Option<f64>>> {
+    if count < 2 || ((end - start) / step - (count - 1) as f64).abs() > 0.5 {
+        return None;
+    }
+    let range = start..=end;
+    Some(
+        (0..count)
+            .map(|i| Some(numeric::sample_x(&range, count, i)))
+            .collect(),
+    )
 }
 
 pub(super) fn sample_native(
@@ -181,9 +195,32 @@ fn parse_number(item: &str, decimal_comma: bool) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{elements, run};
     use crate::app::operations::{Calculator, clean_paste};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn reads_the_vectors_qalc_prints_as_ranges() {
+        // What qalc 5.8.2 and later print for genvector(x, 0, 1, 1000, x).
+        let step = "0.0010010010010010010010010010010010010010010010010";
+        let values = elements(&format!("[0:{step}:1]"), 1000, false).unwrap();
+        assert_eq!(
+            (values.len(), values[0], values[999]),
+            (1000, Some(0.0), Some(1.0))
+        );
+        for (index, value) in values.iter().enumerate() {
+            assert!((value.unwrap() - index as f64 / 999.0).abs() < 1e-15);
+        }
+        let ones = (-5..=5).map(|i| Some(f64::from(i))).collect();
+        assert_eq!(elements("[−5:5]", 11, false), Some(ones));
+        let halves = vec![Some(0.5), Some(0.75), Some(1.0)];
+        assert_eq!(elements("[0,5:0,25:1]", 3, true), Some(halves));
+        assert_eq!(elements("[0:1:5]", 7, false), None);
+        assert_eq!(
+            elements("[1  2]", 2, false),
+            Some(vec![Some(1.0), Some(2.0)])
+        );
+    }
 
     #[test]
     fn sample_handles_gaps_and_locale() {
